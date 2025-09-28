@@ -67,11 +67,78 @@ var Grid = {
 	fullH 		: null,
 };
 
+// --- fuzzy compare for mode detection ---
+const EPS_ABS = 2;                 // [px] forgive tiny quantization
+const EPS_REL = 0.002;             // [fraction] forgive 0.2% rounding
+
+function near(a, b, scale) {
+  const eps = Math.max(EPS_ABS, Math.ceil((scale || 1) * EPS_REL));
+  return Math.abs(a - b) <= eps;
+}
+
+function screenForClient(c) {
+  // Prefer the screen under the window center; if cursor is inside the window, use that.
+  try {
+    const g = c.frameGeometry;
+    const center = Qt.point(g.x + Math.floor(g.width/2), g.y + Math.floor(g.height/2));
+    const cur = workspace.cursorPos;
+    const curInside = (cur.x >= g.x && cur.x < g.x + g.width && cur.y >= g.y && cur.y < g.y + g.height);
+    if (workspace.screenAt) return workspace.screenAt(curInside ? cur : center);
+  } catch (_) {}
+  return workspace.activeScreen; // fallback
+}
+
+function workAreaOnScreen(screen, desktop) {
+  // MaximizeArea respects panels; PlacementArea can be smaller/weirder. Use MaximizeArea for tiling.
+  return workspace.clientArea(KWin.MaximizeArea, screen, desktop);
+}
+
+function ensureOnScreen(c, targetScreen) {
+  // If KWin still associates the window with another output (common with XWayland/Electron),
+  // shift it first so workarea computations & clamping use the target output.
+  if (typeof c.screen === "number" && c.screen !== targetScreen && workspace.sendClientToScreen) {
+    workspace.sendClientToScreen(c, targetScreen);
+  }
+}
+
+// Deterministic integer split: sums to 'total', left/top biased (eliminates 1-px seams).
+function splitInt(total, parts) {
+  const base = Math.floor(total / parts);
+  const rem  = total - base * parts;
+  const out = new Array(parts);
+  for (let i = 0; i < parts; i++) out[i] = base + (i < rem ? 1 : 0);
+  return out;
+}
+
 /**
  * Updates the points and sizes based on the current active screen
  *
  * Modify this, if you want to move the grid borders
  */
+function updateToCurrentScreen(targetScreen) {
+  var screenBounds = workAreaOnScreen(targetScreen, workspace.currentDesktop);
+
+  // Thirds (no-gap)
+  var thirdsW = splitInt(screenBounds.width, 3);
+  Grid.oneThirdX = thirdsW[0];                 // start of middle column
+  Grid.twoThirdX = thirdsW[0] + thirdsW[1];    // start of right column
+
+  // Halves (no-gap)
+  var halvesW = splitInt(screenBounds.width, 2);
+  Grid.halfX = halvesW[0];
+
+  var halvesH = splitInt(screenBounds.height, 2);
+  Grid.halfY = halvesH[0];
+
+  Grid.oneThirdW = thirdsW[0];
+  Grid.halfW     = halvesW[0];
+  Grid.twoThirdW = thirdsW[0] + thirdsW[1];
+  Grid.fullW     = screenBounds.width;
+
+  Grid.halfH     = halvesH[0];
+  Grid.fullH     = screenBounds.height;
+}
+/*
 function updateToCurrentScreen () {
 console.info("Hrw: updateToCurrentScreen () ")
 	var screenBounds = getActiveScreenBounds();
@@ -102,7 +169,7 @@ console.info("Hrw: updateToCurrentScreen () ")
 	console.info("fullW:     "+Grid.fullW);
 	console.info("halfH:     "+Grid.halfH);
 	console.info("fullH:     "+Grid.fullH);
-}
+}*/
 
 
 function init() {
@@ -137,27 +204,25 @@ console.info("Hrw: registerShortcuts() ")
  *
  *	@returns: QRect containing x,y, width and height fields
  */
-function getActiveWindowBounds() {
-console.info("Hrw: getActiveWindowBounds() ")
-	var activeWindowBounds = workspace.activeWindow.frameGeometry;
-
-	//Substract the relative screen position (Multi screen support)
-	var screenBounds = getActiveScreenBounds();
-	activeWindowBounds.x -= screenBounds.x;
-	activeWindowBounds.y -= screenBounds.y;
-
-	return activeWindowBounds;
+function getActiveWindowBounds(targetScreen) {
+  var activeWindowBounds = workspace.activeWindow.frameGeometry;
+  var screenBounds = getActiveScreenBounds(targetScreen);
+  activeWindowBounds.x -= screenBounds.x;
+  activeWindowBounds.y -= screenBounds.y;
+  return activeWindowBounds;
 }
+
 
 /**
  *	Get the bounds of the screen the currently active window is on
  *
  * 	@returns: QRect containing x,y, width and height fields
  */
-function getActiveScreenBounds() {
-console.info("Hrw: getActiveScreenBounds() ")
-	return workspace.clientArea(KWin.PlacementArea, workspace.activeScreen, workspace.currentDesktop);
+function getActiveScreenBounds(targetScreen) {
+  return workAreaOnScreen(targetScreen, workspace.currentDesktop);
 }
+
+
 
 /**
  *  Get the window position mode, the window is currently in.
@@ -166,192 +231,106 @@ console.info("Hrw: getActiveScreenBounds() ")
  *  @returns: integer One of the values in the variable modes
  */
 function getMode() {
-console.info("Hrw: getMode() ")
-	console.info("getMode called");
-	var windowBounds = getActiveWindowBounds();
+  console.info("Hrw: getMode()");
+  var windowBounds = getActiveWindowBounds();      // shim supplies target screen
+  var screenBounds = getActiveScreenBounds();      // shim supplies target screen
+  var S = Math.max(screenBounds.width, screenBounds.height);
+  console.info("Window bounds: "+windowBounds.x+"/"+windowBounds.y+"/"+windowBounds.width+"/"+windowBounds.height);
 
-	console.info("Window bounds: "+windowBounds.x+"/"+windowBounds.y+"/"+windowBounds.height+"/"+windowBounds.width);
+  // --- X classification ---
+  var possibleModesX = [];
+  if (near(windowBounds.x, 0, S)) {
+    possibleModesX.push(
+      MODES.UP_LEFT_HALF, MODES.UP_LEFT_ONE_THIRD, MODES.UP_LEFT_TWO_THIRD,
+      MODES.UP_CENTER_FULL, MODES.LEFT_HALF, MODES.LEFT_ONE_THIRD,
+      MODES.LEFT_TWO_THIRD, MODES.CENTER_FULL, MODES.DOWN_LEFT_HALF,
+      MODES.DOWN_LEFT_ONE_THIRD, MODES.DOWN_LEFT_TWO_THIRD, MODES.DOWN_CENTER_FULL
+    );
+  } else if (near(windowBounds.x, Grid.oneThirdX, S)) {
+    possibleModesX.push(
+      MODES.UP_RIGHT_TWO_THIRD, MODES.UP_CENTER_CENTER, MODES.RIGHT_TWO_THIRD,
+      MODES.CENTER_CENTER, MODES.DOWN_RIGHT_TWO_THIRD, MODES.DOWN_CENTER_CENTER
+    );
+  } else if (near(windowBounds.x, Grid.halfX, S)) {
+    possibleModesX.push(MODES.UP_RIGHT_HALF, MODES.RIGHT_HALF, MODES.DOWN_RIGHT_HALF);
+  } else if (near(windowBounds.x, Grid.twoThirdX, S)) {
+    possibleModesX.push(MODES.UP_RIGHT_ONE_THIRD, MODES.RIGHT_ONE_THIRD, MODES.DOWN_RIGHT_ONE_THIRD);
+  }
+  if (possibleModesX.length === 0) return MODES.FLOATING;
 
-	//Getting possible modes due to the windows' X position
+  // --- Y classification ---
+  var possibleModesY = [];
+  if (near(windowBounds.y, 0, S)) {
+    possibleModesY.push(
+      MODES.UP_LEFT_HALF, MODES.UP_LEFT_ONE_THIRD, MODES.UP_LEFT_TWO_THIRD,
+      MODES.UP_CENTER_CENTER, MODES.UP_CENTER_FULL, MODES.UP_RIGHT_HALF,
+      MODES.UP_RIGHT_ONE_THIRD, MODES.UP_RIGHT_TWO_THIRD, MODES.LEFT_HALF,
+      MODES.LEFT_ONE_THIRD, MODES.LEFT_TWO_THIRD, MODES.RIGHT_HALF,
+      MODES.RIGHT_ONE_THIRD, MODES.RIGHT_TWO_THIRD, MODES.CENTER_CENTER,
+      MODES.CENTER_FULL
+    );
+  } else if (near(windowBounds.y, Grid.halfY, S)) {
+    possibleModesY.push(
+      MODES.DOWN_LEFT_HALF, MODES.DOWN_LEFT_ONE_THIRD, MODES.DOWN_LEFT_TWO_THIRD,
+      MODES.DOWN_CENTER_CENTER, MODES.DOWN_CENTER_FULL, MODES.DOWN_RIGHT_HALF,
+      MODES.DOWN_RIGHT_ONE_THIRD, MODES.DOWN_RIGHT_TWO_THIRD
+    );
+  }
+  if (possibleModesY.length === 0) return MODES.FLOATING;
 
-	console.info("Determining current mode");
+  // --- Width classification ---
+  var possibleModesW = [];
+  if (near(windowBounds.width, Grid.oneThirdW, S)) {
+    possibleModesW.push(
+      MODES.UP_LEFT_ONE_THIRD, MODES.UP_CENTER_CENTER, MODES.UP_RIGHT_ONE_THIRD,
+      MODES.RIGHT_ONE_THIRD, MODES.CENTER_CENTER, MODES.LEFT_ONE_THIRD,
+      MODES.DOWN_LEFT_ONE_THIRD, MODES.DOWN_CENTER_CENTER, MODES.DOWN_RIGHT_ONE_THIRD
+    );
+  } else if (near(windowBounds.width, Grid.halfW, S)) {
+    possibleModesW.push(
+      MODES.UP_LEFT_HALF, MODES.UP_RIGHT_HALF, MODES.LEFT_HALF, MODES.RIGHT_HALF,
+      MODES.DOWN_LEFT_HALF, MODES.DOWN_RIGHT_HALF
+    );
+  } else if (near(windowBounds.width, Grid.twoThirdW, S)) {
+    possibleModesW.push(
+      MODES.UP_LEFT_TWO_THIRD, MODES.UP_RIGHT_TWO_THIRD, MODES.LEFT_TWO_THIRD,
+      MODES.RIGHT_TWO_THIRD, MODES.DOWN_LEFT_TWO_THIRD, MODES.DOWN_RIGHT_TWO_THIRD
+    );
+  } else if (near(windowBounds.width, Grid.fullW, S)) {
+    possibleModesW.push(MODES.UP_CENTER_FULL, MODES.CENTER_FULL, MODES.DOWN_CENTER_FULL);
+  }
+  if (possibleModesW.length === 0) return MODES.FLOATING;
 
-	var possibleModesX = [];
+  // --- Height classification ---
+  var possibleModesH = [];
+  if (near(windowBounds.height, Grid.halfH, S)) {
+    possibleModesH.push(
+      MODES.UP_LEFT_ONE_THIRD, MODES.UP_LEFT_HALF, MODES.UP_LEFT_TWO_THIRD,
+      MODES.UP_CENTER_CENTER, MODES.UP_CENTER_FULL, MODES.UP_RIGHT_ONE_THIRD,
+      MODES.UP_RIGHT_HALF, MODES.UP_RIGHT_TWO_THIRD, MODES.DOWN_LEFT_ONE_THIRD,
+      MODES.DOWN_LEFT_HALF, MODES.DOWN_LEFT_TWO_THIRD, MODES.DOWN_CENTER_CENTER,
+      MODES.DOWN_CENTER_FULL, MODES.DOWN_RIGHT_ONE_THIRD, MODES.DOWN_RIGHT_HALF,
+      MODES.DOWN_RIGHT_TWO_THIRD
+    );
+  } else if (near(windowBounds.height, Grid.fullH, S)) {
+    possibleModesH.push(
+      MODES.LEFT_ONE_THIRD, MODES.LEFT_HALF, MODES.LEFT_TWO_THIRD,
+      MODES.CENTER_CENTER, MODES.CENTER_FULL, MODES.RIGHT_ONE_THIRD,
+      MODES.RIGHT_HALF, MODES.RIGHT_TWO_THIRD
+    );
+  }
+  if (possibleModesH.length === 0) return MODES.FLOATING;
 
-	if (windowBounds.x == 0) {
-		possibleModesX.push(MODES.UP_LEFT_HALF);
-		possibleModesX.push(MODES.UP_LEFT_ONE_THIRD);
-		possibleModesX.push(MODES.UP_LEFT_TWO_THIRD);
-		possibleModesX.push(MODES.UP_CENTER_FULL);
-		possibleModesX.push(MODES.LEFT_HALF);
-		possibleModesX.push(MODES.LEFT_ONE_THIRD);
-		possibleModesX.push(MODES.LEFT_TWO_THIRD);
-		possibleModesX.push(MODES.CENTER_FULL);
-		possibleModesX.push(MODES.DOWN_LEFT_HALF);
-		possibleModesX.push(MODES.DOWN_LEFT_ONE_THIRD);
-		possibleModesX.push(MODES.DOWN_LEFT_TWO_THIRD);
-		possibleModesX.push(MODES.DOWN_CENTER_FULL);
-	}
-	else if (windowBounds.x == Grid.oneThirdX) {
-		possibleModesX.push(MODES.UP_RIGHT_TWO_THIR);
-		possibleModesX.push(MODES.UP_CENTER_CENTER);
-		possibleModesX.push(MODES.RIGHT_TWO_THIRD);
-		possibleModesX.push(MODES.CENTER_CENTER);
-		possibleModesX.push(MODES.DOWN_RIGHT_TWO_THIRD);
-		possibleModesX.push(MODES.DOWN_CENTER_CENTER);
-	}
-	else if (windowBounds.x == Grid.halfX) {
-		possibleModesX.push(MODES.UP_RIGHT_HALF);
-		possibleModesX.push(MODES.RIGHT_HALF);
-		possibleModesX.push(MODES.DOWN_RIGHT_HALF);
-	}
-	else if (windowBounds.x == Grid.twoThirdX) {
-		possibleModesX.push(MODES.UP_RIGHT_ONE_THIRD);
-		possibleModesX.push(MODES.RIGHT_ONE_THIRD);
-		possibleModesX.push(MODES.DOWN_RIGHT_ONE_THIRD);
-	}
-
-	if (possibleModesX.length == 0) {
-		//X value is not maching any mode. Window is "floating"
-		return MODES.FLOATING;
-	}
-
-	console.info("Possible modes found for X");
-
-
-	//Getting possible modes due to the windows' Y position'
-
-	var possibleModesY = [];
-
-	if (windowBounds.y == 0) {
-		possibleModesY.push(MODES.UP_LEFT_HALF);
-		possibleModesY.push(MODES.UP_LEFT_ONE_THIRD);
-		possibleModesY.push(MODES.UP_LEFT_TWO_THIRD);
-		possibleModesY.push(MODES.UP_CENTER_CENTER);
-		possibleModesY.push(MODES.UP_CENTER_FULL);
-		possibleModesY.push(MODES.UP_RIGHT_HALF);
-		possibleModesY.push(MODES.UP_RIGHT_ONE_THIRD);
-		possibleModesY.push(MODES.UP_RIGHT_TWO_THIRD);
-		possibleModesY.push(MODES.LEFT_HALF);
-		possibleModesY.push(MODES.LEFT_ONE_THIRD);
-		possibleModesY.push(MODES.LEFT_TWO_THIRD);
-		possibleModesY.push(MODES.RIGHT_HALF);
-		possibleModesY.push(MODES.RIGHT_ONE_THIRD);
-		possibleModesY.push(MODES.RIGHT_TWO_THIRD);
-		possibleModesY.push(MODES.CENTER_CENTER);
-		possibleModesY.push(MODES.CENTER_FULL);
-	}
-	else if (windowBounds.y == Grid.halfY) {
-		possibleModesY.push(MODES.DOWN_LEFT_HALF);
-		possibleModesY.push(MODES.DOWN_LEFT_ONE_THIRD);
-		possibleModesY.push(MODES.DOWN_LEFT_TWO_THIRD);
-		possibleModesY.push(MODES.DOWN_CENTER_CENTER);
-		possibleModesY.push(MODES.DOWN_CENTER_FULL);
-		possibleModesY.push(MODES.DOWN_RIGHT_HALF);
-		possibleModesY.push(MODES.DOWN_RIGHT_ONE_THIRD);
-		possibleModesY.push(MODES.DOWN_RIGHT_TWO_THIRD);
-	}
-
-	if (possibleModesY.length == 0) {
-		//Y value is not maching any mode. Window is "floating"
-		return MODES.FLOATING;
-	}
-
-
-	//Getting possible modes due to the windows' width
-
-	var possibleModesW = [];
-
-	if (windowBounds.width == Grid.oneThirdW) {
-		possibleModesW.push(MODES.UP_LEFT_ONE_THIRD);
-		possibleModesW.push(MODES.UP_CENTER_CENTER);
-		possibleModesW.push(MODES.UP_RIGHT_ONE_THIRD);
-		possibleModesW.push(MODES.RIGHT_ONE_THIRD);
-		possibleModesW.push(MODES.CENTER_CENTER);
-		possibleModesW.push(MODES.LEFT_ONE_THIRD);
-		possibleModesW.push(MODES.DOWN_LEFT_ONE_THIRD);
-		possibleModesW.push(MODES.DOWN_CENTER_CENTER);
-		possibleModesW.push(MODES.DOWN_RIGHT_ONE_THIRD);
-	}
-	else if (windowBounds.width == Grid.halfW) {
-		possibleModesW.push(MODES.UP_LEFT_HALF);
-		possibleModesW.push(MODES.UP_RIGHT_HALF);
-		possibleModesW.push(MODES.LEFT_HALF);
-		possibleModesW.push(MODES.RIGHT_HALF);
-		possibleModesW.push(MODES.DOWN_LEFT_HALF);
-		possibleModesW.push(MODES.DOWN_RIGHT_HALF);
-	}
-	else if (windowBounds.width == Grid.twoThirdW) {
-		possibleModesW.push(MODES.UP_LEFT_TWO_THIRD);
-		possibleModesW.push(MODES.UP_RIGHT_TWO_THIRD);
-		possibleModesW.push(MODES.LEFT_TWO_THIRD);
-		possibleModesW.push(MODES.RIGHT_TWO_THIRD);
-		possibleModesW.push(MODES.DOWN_LEFT_TWO_THIRD);
-		possibleModesW.push(MODES.DOWN_RIGHT_TWO_THIRD);
-	}
-	else if (windowBounds.width == Grid.fullW) {
-		possibleModesW.push(MODES.UP_CENTER_FULL);
-		possibleModesW.push(MODES.CENTER_FULL);
-		possibleModesW.push(MODES.DOWN_CENTER_FULL);
-	}
-
-	if (possibleModesW.length == 0) {
-		//Width value is not maching any mode. Window is "floating"
-		return MODES.FLOATING;
-	}
-
-
-	//Getting possible modes due to the windows' height
-
-	var possibleModesH = [];
-
-	if (windowBounds.height == Grid.halfH) {
-		possibleModesH.push(MODES.UP_LEFT_ONE_THIRD);
-		possibleModesH.push(MODES.UP_LEFT_HALF);
-		possibleModesH.push(MODES.UP_LEFT_TWO_THIRD);
-		possibleModesH.push(MODES.UP_CENTER_CENTER);
-		possibleModesH.push(MODES.UP_CENTER_FULLL);
-		possibleModesH.push(MODES.UP_RIGHT_ONE_THIRD);
-		possibleModesH.push(MODES.UP_RIGHT_HALF);
-		possibleModesH.push(MODES.UP_RIGHT_TWO_THIRD);
-		possibleModesH.push(MODES.DOWN_LEFT_ONE_THIRD);
-		possibleModesH.push(MODES.DOWN_LEFT_HALF);
-		possibleModesH.push(MODES.DOWN_LEFT_TWO_THIRD);
-		possibleModesH.push(MODES.DOWN_CENTER_CENTER);
-		possibleModesH.push(MODES.DOWN_CENTER_FULL);
-		possibleModesH.push(MODES.DOWN_RIGHT_ONE_THIRD);
-		possibleModesH.push(MODES.DOWN_RIGHT_HALF);
-		possibleModesH.push(MODES.DOWN_RIGHT_TWO_THIRD);
-	}
-	else if (windowBounds.height == Grid.fullH) {
-		possibleModesH.push(MODES.LEFT_ONE_THIRD);
-		possibleModesH.push(MODES.LEFT_HALF);
-		possibleModesH.push(MODES.LEFT_TWO_THIRD);
-		possibleModesH.push(MODES.CENTER_CENTER);
-		possibleModesH.push(MODES.CENTER_FULL);
-		possibleModesH.push(MODES.RIGHT_ONE_THIRD);
-		possibleModesH.push(MODES.RIGHT_HALF);
-		possibleModesH.push(MODES.RIGHT_TWO_THIRD);
-	}
-
-	if (possibleModesH.length == 0) {
-		//Height value is not maching any mode. Window is "floating"
-		return MODES.FLOATING;
-	}
-
-
-	//Checking if one mode satisfies all 4 parameters. X, Y, Widht and Height
-	for (var ix in possibleModesX) {
-		var mode = possibleModesX[ix];
-
-		//Check if this possible mode for the X condition also satisfy the Y, width and height condition. If yes, this is our result.
-		if (possibleModesY.indexOf(mode) > -1 && possibleModesW.indexOf(mode) > -1 && possibleModesH.indexOf(mode) > -1)
-			return mode;
-	}
-
-	//No valid mode found. Window is "floating"
-	return MODES.FLOATING;
-
+  // --- Intersection ---
+  for (var ix in possibleModesX) {
+    var mode = possibleModesX[ix];
+    if (possibleModesY.indexOf(mode) > -1 &&
+        possibleModesW.indexOf(mode) > -1 &&
+        possibleModesH.indexOf(mode) > -1) {
+      return mode;
+    }
+  }
+  return MODES.FLOATING;
 }
 
 
@@ -362,7 +341,7 @@ console.info("Hrw: getMode() ")
  *
  * @returns: void
  */
-function setMode(mode) {
+function setMode(mode, targetScreen) {
 console.info("Hrw: setMode(mode) ")
 	console.info("Set mode: "+mode);
 	var x,y,w,h;
@@ -409,18 +388,18 @@ console.info("Hrw: setMode(mode) ")
 	console.info("New bounds: "+x+"/"+y+"/"+w+"/"+h);
 
 	//Calulating the new window frame geometry relative to the active screen
-	var screenBounds = getActiveScreenBounds();
-	var newFrameGeometry =  {
-		x: x+screenBounds.x,
-		y: y+screenBounds.y,
-		width: w,
-		height: h
-	}
+      var screenBounds = getActiveScreenBounds(targetScreen);
+      var newFrameGeometry = {
+        x: x + screenBounds.x,
+        y: y + screenBounds.y,
+        width: w,
+        height: h
+      };
 
-
-
-	//Setting the new window geomety
-	workspace.activeWindow.frameGeometry = newFrameGeometry;
+      var win = workspace.activeWindow;
+      if (!win) return;
+      win.setMaximize(false, false);
+      win.frameGeometry = newFrameGeometry;
 }
 
 
@@ -436,27 +415,41 @@ console.info("Hrw: setMode(mode) ")
  * @returns void
  */
 function updateWindowPosition(startMode, nextModeMap) {
-console.info("Hrw: updateWindowPosition(startMode, nextModeMap) ")
-	console.info("Update window position: "+startMode);
-	//Update the grid parameters to the currently active screen (Multi monitor support)
-	updateToCurrentScreen();
+  var c = workspace.activeWindow;
+  if (!c || !c.moveable || !c.resizeable) return;
+  c.setMaximize(false,false);
+  if (!c) return;
 
-	//Get the current mode associated with the size and position of the window.
-	var currentMode = getMode();
+  // Decide the output and align KWin's internal association
+  var targetScreen = screenForClient(c);
+  ensureOnScreen(c, targetScreen);
 
-	console.info("Current mode: "+currentMode);
+  // Build grid for that output
+  updateToCurrentScreen(targetScreen);
 
-	//See if there is a valid followup mode available for the current mode (Repeated key presses)
-	var nextMode = nextModeMap[currentMode];
+  // Mode detection (use the same target screen for bounds)
+  var currentMode = (function(){
+    // reuse original getMode logic but ensure it references the same target screen
+    // Quick shim: temporarily override helpers
+    var _getActiveWindowBounds = getActiveWindowBounds;
+    var _getActiveScreenBounds = getActiveScreenBounds;
+    try {
+      getActiveWindowBounds = function(){ return _getActiveWindowBounds(targetScreen); };
+      getActiveScreenBounds = function(){ return _getActiveScreenBounds(targetScreen); };
+      return getMode();
+    } finally {
+      getActiveWindowBounds = _getActiveWindowBounds;
+      getActiveScreenBounds = _getActiveScreenBounds;
+    }
+  })();
 
-	if (nextMode == undefined) {
-		//No valid followup. Applying start mode
-		nextMode = startMode;
-	}
+  var nextMode = nextModeMap[currentMode];
+  if (nextMode === undefined) nextMode = startMode;
 
-	//Moving window to new designated position and size
-	setMode(nextMode);
+  // Apply on the same output
+  setMode(nextMode, targetScreen);
 }
+
 
 
 
